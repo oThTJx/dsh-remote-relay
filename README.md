@@ -50,4 +50,4 @@ Generate the device secret with `openssl rand -hex 32`. Front with a real certif
 
 ## Protocol
 
-Defined in [`@firefly0621/dsh-remote-protocol`](../../packages/remote/protocol/README.md) — this package only implements the relay side.
+Defined in [`@firefly0621/dsh-remote-protocol`](https://github.com/oThTJx/dsh-remote-protocol) — this package only implements the relay side.
