@@ -1,4 +1,4 @@
-﻿{
+{
   "name": "@firefly0621/dsh-remote-relay",
   "description": "Standalone WebSocket relay for dsh remote control: device registry, pairing, session routing",
   "version": "0.1.0-rc.6",
