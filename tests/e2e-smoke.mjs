@@ -2,7 +2,7 @@
  * End-to-end smoke against the real relay bin: register a device, pair an app
  * with the minted code, and round-trip a request/response.
  *
- * Run: node apps/relay-server/tests/e2e-smoke.mjs  (requires a running relay)
+ * Run: node apps/remote-relay/tests/e2e-smoke.mjs  (requires a running relay)
  */
 import WebSocket from 'ws'
 
