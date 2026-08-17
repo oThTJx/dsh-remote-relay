@@ -2,7 +2,7 @@
 
 Standalone WebSocket relay for the dsh remote-control capability. Devices (dsh hosts running `@firefly0621/dsh-remote-control`) connect outbound with a long-lived secret; mobile apps pair with a short-lived code; the relay routes request/response messages between them. The PC behind NAT never needs an inbound port — it dials out, exactly like the OpenClaw/Claw mobile-control pattern.
 
-The relay is a single-process Node service with no harness dependency. It does not persist anything: device registrations, pairing codes, and sessions live in memory and are cleared on restart.
+The relay is a single-process Node service with no harness dependency. Device registrations and pairing codes live in memory and clear on restart; **app sessions persist** when `DSH_RELAY_DATA_DIR` is set, so a paired phone resumes with its stored token instead of re-pairing.
 
 ## Configuration (environment variables)
 
@@ -11,6 +11,8 @@ The relay is a single-process Node service with no harness dependency. It does n
 | `PORT` | `8787` | Listening port |
 | `NODE_ENV` | — | `production` requires TLS (refuses plaintext WS) |
 | `DSH_RELAY_DEVICE_SECRETS` | — | Comma-separated `deviceId:secret` pairs; the device registry |
+| `DSH_RELAY_ALLOW_AUTO_REGISTER` | — | `1` accepts the first hello for an unknown random `deviceId` and binds it (the plugin's zero-config mode) |
+| `DSH_RELAY_DATA_DIR` | — | Directory for durable session storage; absent keeps sessions in memory |
 | `TLS_CERT` / `TLS_KEY` | — | PEM cert/key paths; required when `NODE_ENV=production` |
 
 ## Deployment (systemd on a VPS)
@@ -40,6 +42,8 @@ Generate the device secret with `openssl rand -hex 32`. Front with a real certif
 ## Security notes
 
 - **Auth is two-layered**: the device secret proves "this is the registered host"; the pairing code proves "the phone user is at the keyboard of that host". The relay forwards requests only between a paired app and its bound device.
+- **`DSH_RELAY_ALLOW_AUTO_REGISTER` is first-seen-wins**: an unknown `deviceId` binds to whatever secret its first hello presents. Plugin-generated deviceIds are random 128-bit values, so claiming a vacant id gains nothing; keep the flag off on shared relays.
+- **Session control is device-side**: the bound device can list (`sessions.list`) and revoke (`sessions.revoke`) its app sessions; a revoked token stops resuming.
 - **The relay is a dumb pipe**: it never inspects command payloads and never persists message content. Compromising the relay exposes routing metadata, not settings values — though settings reads still transit it, so TLS is mandatory.
 - **Pairing codes**: 6 digits, 10-minute TTL, one-time use, max 5 wrong attempts. Rotated by the device on every relay (re)registration.
 - **Heartbeats**: peers ping every 30s; a silent connection is dropped after 60s.
