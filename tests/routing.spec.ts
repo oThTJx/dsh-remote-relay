@@ -198,11 +198,11 @@ describe('relay request routing', () => {
     resumed.close()
   })
 
-  it('rejects an event without an event name from an unauthenticated socket', async () => {
+  it('rejects an event from an unauthenticated socket', async () => {
     const server = await startRelay()
     const stranger = connect(server)
     await new Promise<void>((resolve) => { stranger.on('open', () => { resolve() }) })
-    stranger.send(serializeMessage({ type: 'event', payload: { payload: { text: 'x' } } }))
+    stranger.send(serializeMessage({ type: 'event', payload: { event: 'chat/chunk', payload: { text: 'x' } } }))
     const error = await nextMessage(stranger, message => message.type === 'error')
     expect((error.payload as { code: string }).code).toBe('auth.failed')
     stranger.close()

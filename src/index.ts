@@ -91,7 +91,7 @@ export class RelayServer {
       http = createHttpServer()
     }
     this.http = http
-    this.wss = new WebSocketServer({ server: http })
+    this.wss = new WebSocketServer({ server: http, maxPayload: 1_048_576 })
     this.wss.on('connection', (socket) => { this.handleConnection(socket) })
     this.heartbeatTimer = setInterval(() => { this.reap() }, HEARTBEAT_INTERVAL_MS)
     await new Promise<void>((resolve, reject) => {
@@ -188,6 +188,7 @@ export class RelayServer {
         const secret = (message.payload as { deviceSecret?: unknown }).deviceSecret
         const known = deviceId === undefined ? undefined : this.deviceSecrets.get(deviceId)
         if (typeof deviceId !== 'string' || typeof secret !== 'string' || (secret !== known && !(this.allowAutoRegister && known === undefined))) {
+          this.log(`auth failed for device ${String(deviceId)}`)
           this.reply(socket, { type: 'error', payload: { code: 'auth.failed', message: 'bad device secret' } })
           socket.close()
           return
@@ -199,6 +200,7 @@ export class RelayServer {
           previous.socket.close()
         }
         this.devices.set(deviceId, { socket, name: deviceId })
+        this.log(`device ${deviceId} registered${known === undefined ? ' (auto-registered)' : ''}`)
         // The relay mints a fresh pairing code for every (re)registration and
         // hands it to the device, which displays it to the user.
         const { code, expiresAt } = this.pairings.issue(deviceId)
@@ -209,6 +211,7 @@ export class RelayServer {
         const { pairingCode } = message.payload as { pairingCode: string }
         const deviceId = this.pairings.verify(pairingCode)
         if (deviceId === undefined) {
+          this.log('pair rejected: bad or expired pairing code')
           this.reply(socket, { type: 'error', payload: { code: 'pair.invalid', message: 'bad or expired pairing code' } })
           return
         }
@@ -220,6 +223,7 @@ export class RelayServer {
         }
         const token = this.sessions.create(deviceId, connection.name)
         this.sessionSockets.set(token, socket)
+        this.log(`session paired for device ${deviceId}`)
         this.reply(socket, { type: 'pair-result', deviceId, payload: { token, deviceId, deviceName: connection.name } })
         break
       }
@@ -344,5 +348,10 @@ export class RelayServer {
 
   private reply(socket: WebSocket, message: Envelope): void {
     if (socket.readyState === WebSocket.OPEN) socket.send(serializeMessage(message))
+  }
+
+  /** One-line lifecycle log to stderr; never includes secrets or tokens. */
+  private log(line: string): void {
+    console.error(`[relay] ${line}`)
   }
 }

@@ -32,4 +32,4 @@ if (process.env.TLS_KEY !== undefined) relayConfig.tlsKey = process.env.TLS_KEY
 
 const relay = new RelayServer(relayConfig)
 await relay.start()
-console.log(`dsh-remote-relay listening on :${relay.port}`)
+console.error(`[relay] listening on :${relay.port}${requireTls ? ' (TLS)' : ''}${allowAutoRegister ? ' (auto-register)' : ''}`)
