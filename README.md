@@ -1,5 +1,7 @@
 # @firefly0621/dsh-remote-relay
 
+English | [中文](README.zh.md)
+
 Standalone WebSocket relay for the dsh remote-control capability. Devices (dsh hosts running `@firefly0621/dsh-remote-control`) connect outbound with a long-lived secret; mobile apps pair with a short-lived code; the relay routes request/response messages between them. The PC behind NAT never needs an inbound port — it dials out, exactly like the OpenClaw/Claw mobile-control pattern.
 
 The relay is a single-process Node service with no harness dependency. Device registrations and pairing codes live in memory and clear on restart; **app sessions persist** when `DSH_RELAY_DATA_DIR` is set, so a paired phone resumes with its stored token instead of re-pairing.
