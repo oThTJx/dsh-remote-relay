@@ -9,6 +9,7 @@ import {
   parseMessage,
   serializeMessage,
   type Envelope,
+  type EventPayload,
 } from '@firefly0621/dsh-remote-protocol'
 import { PairingStore, SessionStore } from './pairing.ts'
 
@@ -51,6 +52,8 @@ export class RelayServer {
   private readonly sessions: SessionStore
   /** request id → the app socket waiting for the device's response. */
   private readonly pending = new Map<string, WebSocket>()
+  /** session token → the app socket bound to it (device→app `event` pushes). */
+  private readonly sessionSockets = new Map<string, WebSocket>()
   private readonly lastSeen = new Map<WebSocket, number>()
   private heartbeatTimer: NodeJS.Timeout | undefined
   private listening = false
@@ -110,6 +113,7 @@ export class RelayServer {
     this.sockets.clear()
     this.devices.clear()
     this.pending.clear()
+    this.sessionSockets.clear()
     this.lastSeen.clear()
     await new Promise<void>((resolve) => {
       this.wss?.close(() => { resolve() })
@@ -155,13 +159,16 @@ export class RelayServer {
     }
   }
 
-  /** Remove a socket from every registry (devices, pending, lastSeen). */
+  /** Remove a socket from every registry (devices, pending, sessionSockets, lastSeen). */
   private deregister(socket: WebSocket): void {
     for (const [deviceId, connection] of this.devices) {
       if (connection.socket === socket) this.devices.delete(deviceId)
     }
     for (const [id, waiting] of this.pending) {
       if (waiting === socket) this.pending.delete(id)
+    }
+    for (const [token, bound] of this.sessionSockets) {
+      if (bound === socket) this.sessionSockets.delete(token)
     }
     this.lastSeen.delete(socket)
   }
@@ -212,6 +219,7 @@ export class RelayServer {
           return
         }
         const token = this.sessions.create(deviceId, connection.name)
+        this.sessionSockets.set(token, socket)
         this.reply(socket, { type: 'pair-result', deviceId, payload: { token, deviceId, deviceName: connection.name } })
         break
       }
@@ -243,11 +251,16 @@ export class RelayServer {
       }
       case 'resume': {
         const token = (message.payload as { token?: unknown }).token
-        const session = typeof token === 'string' ? this.sessions.resolve(token) : undefined
+        if (typeof token !== 'string') {
+          this.reply(socket, { type: 'error', payload: { code: 'auth.failed', message: 'invalid token' } })
+          return
+        }
+        const session = this.sessions.resolve(token)
         if (session === undefined) {
           this.reply(socket, { type: 'error', payload: { code: 'auth.failed', message: 'invalid token' } })
           return
         }
+        this.sessionSockets.set(token, socket)
         this.reply(socket, {
           type: 'pair-result',
           deviceId: session.deviceId,
@@ -284,6 +297,28 @@ export class RelayServer {
           type: 'sessions.revoke',
           payload: { sessionId, revoked: this.sessions.revoke(sessionId) },
         })
+        this.sessionSockets.delete(sessionId)
+        break
+      }
+      case 'event': {
+        // Device → relay → app: forward to every app session bound to the
+        // device. Events are one-way pushes (e.g. chat stream deltas); the
+        // relay validates only the event name and passes the payload through.
+        const deviceId = this.deviceIdOf(socket)
+        if (deviceId === undefined) {
+          this.reply(socket, { type: 'error', payload: { code: 'auth.failed', message: 'device not authenticated' } })
+          return
+        }
+        const event = (message.payload as EventPayload).event
+        if (typeof event !== 'string') {
+          this.reply(socket, { type: 'error', payload: { code: 'payload.invalid', message: 'event must be a string' } })
+          return
+        }
+        const forwarded: Envelope = { type: 'event', payload: message.payload }
+        for (const info of this.sessions.list(deviceId)) {
+          const bound = this.sessionSockets.get(info.sessionId)
+          if (bound !== undefined) this.reply(bound, forwarded)
+        }
         break
       }
       case 'response': {

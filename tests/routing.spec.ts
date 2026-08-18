@@ -161,4 +161,50 @@ describe('relay request routing', () => {
     expect((error.payload as { code: string }).code).toBe('auth.failed')
     stranger.close()
   })
+
+  it('pushes a device event to every app session bound to the device', async () => {
+    const server = await startRelay()
+    const device = connect(server)
+    await new Promise<void>((resolve) => { device.on('open', () => { resolve() }) })
+    const { app, token } = await pairApp(server, device)
+
+    device.send(serializeMessage({
+      type: 'event',
+      payload: { event: 'chat/chunk', payload: { text: 'hel' } },
+    }))
+    const pushed = await nextMessage(app, message => message.type === 'event')
+    expect(pushed.payload).toEqual({ event: 'chat/chunk', payload: { text: 'hel' } })
+
+    // A resumed session on a fresh socket still receives pushes.
+    const resumed = connect(server)
+    await new Promise<void>((resolve) => { resumed.on('open', () => { resolve() }) })
+    resumed.send(serializeMessage({ type: 'resume', payload: { token } }))
+    await nextMessage(resumed, message => message.type === 'pair-result')
+    device.send(serializeMessage({
+      type: 'event',
+      payload: { event: 'chat/done', payload: { text: 'hello' } },
+    }))
+    const done = await nextMessage(resumed, message => message.type === 'event')
+    expect((done.payload as { event: string }).event).toBe('chat/done')
+
+    // The revoked token's old socket stops receiving pushes after revoke.
+    device.send(serializeMessage({ type: 'sessions.revoke', id: 'sr-2', payload: { sessionId: token } }))
+    await nextMessage(device, message => message.type === 'sessions.revoke')
+    let received = false
+    app.on('message', () => { received = true })
+    device.send(serializeMessage({ type: 'event', payload: { event: 'chat/chunk', payload: { text: 'x' } } }))
+    await new Promise<void>((resolve) => { setTimeout(resolve, 100) })
+    expect(received).toBe(false)
+    resumed.close()
+  })
+
+  it('rejects an event without an event name from an unauthenticated socket', async () => {
+    const server = await startRelay()
+    const stranger = connect(server)
+    await new Promise<void>((resolve) => { stranger.on('open', () => { resolve() }) })
+    stranger.send(serializeMessage({ type: 'event', payload: { payload: { text: 'x' } } }))
+    const error = await nextMessage(stranger, message => message.type === 'error')
+    expect((error.payload as { code: string }).code).toBe('auth.failed')
+    stranger.close()
+  })
 })
