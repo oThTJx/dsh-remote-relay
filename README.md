@@ -15,6 +15,7 @@ The relay is a single-process Node service with no harness dependency. Device re
 | `DSH_RELAY_DEVICE_SECRETS` | — | Comma-separated `deviceId:secret` pairs; the device registry |
 | `DSH_RELAY_ALLOW_AUTO_REGISTER` | — | `1` accepts the first hello for an unknown random `deviceId` and binds it (the plugin's zero-config mode) |
 | `DSH_RELAY_DATA_DIR` | — | Directory for durable session storage; absent keeps sessions in memory |
+| `DSH_RELAY_TRUST_PROXY` | — | `1` uses the leftmost `X-Forwarded-For` address for per-IP rate limits (only behind a trusted reverse proxy) |
 | `TLS_CERT` / `TLS_KEY` | — | PEM cert/key paths; required when `NODE_ENV=production` |
 
 ## Deployment (systemd on a VPS)
@@ -48,6 +49,9 @@ Generate the device secret with `openssl rand -hex 32`. Front with a real certif
 - **Session control is device-side**: the bound device can list (`sessions.list`) and revoke (`sessions.revoke`) its app sessions; a revoked token stops resuming.
 - **The relay is a dumb pipe**: it never inspects command payloads and never persists message content. Compromising the relay exposes routing metadata, not settings values — though settings reads still transit it, so TLS is mandatory.
 - **Pairing codes**: 6 digits, 10-minute TTL, one-time use, max 5 wrong attempts. Rotated by the device on every relay (re)registration.
+- **Pairing brute-force is rate-limited**: failed `pair` attempts are budgeted per source IP (10 per minute), and an IP over the budget is blocked for 10 minutes. At most 32 concurrent sockets per source IP; device secrets compare in constant time.
+- **Sessions are device-scoped**: `sessions.revoke` drops only sessions bound to the requesting device, never another device's tokens.
+- **Requests fail fast**: a request awaiting a device that disconnects is failed with `device.offline`, and one unanswered past 30 seconds times out — no app socket hangs and no relay memory leaks.
 - **Heartbeats**: peers ping every 30s; a silent connection is dropped after 60s.
 
 ## Protocol

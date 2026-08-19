@@ -207,4 +207,140 @@ describe('relay request routing', () => {
     expect((error.payload as { code: string }).code).toBe('auth.failed')
     stranger.close()
   })
+
+  it('fails a pending request with device.offline when the device disconnects before answering', async () => {
+    const server = await startRelay()
+    const device = connect(server)
+    await new Promise<void>((resolve) => { device.on('open', () => { resolve() }) })
+    const { app, token } = await pairApp(server, device)
+
+    app.send(serializeMessage({
+      type: 'request', id: 'req-pending', deviceId: 'my-pc',
+      payload: { token, method: 'plugin.list', params: {} },
+    }))
+    // The device dies without replying; the awaiting app must fail immediately.
+    device.close()
+    await new Promise<void>((resolve) => { device.on('close', () => { resolve() }) })
+    const error = await nextMessage(app, message => message.type === 'error' && message.id === 'req-pending')
+    expect((error.payload as { code: string }).code).toBe('device.offline')
+  })
+
+  it('lets a device revoke only its own sessions', async () => {
+    relay = new RelayServer({ port: 0, requireTls: false, deviceSecrets: { 'pc-a': 's1', 'pc-b': 's2' } })
+    const server = relay
+    await server.start()
+
+    const deviceA = connect(server)
+    await new Promise<void>((resolve) => { deviceA.on('open', () => { resolve() }) })
+    deviceA.send(serializeMessage({ type: 'hello', deviceId: 'pc-a', payload: { deviceSecret: 's1' } }))
+    const issue = await nextMessage(deviceA, message => message.type === 'pairing.issue')
+    const app = connect(server)
+    await new Promise<void>((resolve) => { app.on('open', () => { resolve() }) })
+    app.send(serializeMessage({ type: 'pair', payload: { pairingCode: (issue.payload as { code: string }).code } }))
+    const result = await nextMessage(app, message => message.type === 'pair-result')
+    const token = (result.payload as { token: string }).token
+
+    // A different device cannot revoke pc-a's session token.
+    const deviceB = connect(server)
+    await new Promise<void>((resolve) => { deviceB.on('open', () => { resolve() }) })
+    deviceB.send(serializeMessage({ type: 'hello', deviceId: 'pc-b', payload: { deviceSecret: 's2' } }))
+    await nextMessage(deviceB, message => message.type === 'pairing.issue')
+    deviceB.send(serializeMessage({ type: 'sessions.revoke', id: 'sr-x', payload: { sessionId: token } }))
+    const revoke = await nextMessage(deviceB, message => message.type === 'sessions.revoke' && message.id === 'sr-x')
+    expect((revoke.payload as { revoked: boolean }).revoked).toBe(false)
+
+    // The token still resumes.
+    const again = connect(server)
+    await new Promise<void>((resolve) => { again.on('open', () => { resolve() }) })
+    again.send(serializeMessage({ type: 'resume', payload: { token } }))
+    const resumed = await nextMessage(again, message => message.type === 'pair-result')
+    expect((resumed.payload as { token: string }).token).toBe(token)
+    deviceA.close()
+    deviceB.close()
+    app.close()
+    again.close()
+  })
+
+  it('blocks an IP once its pair-failure budget is exhausted', async () => {
+    const server = await startRelay()
+    for (let i = 0; i < 10; i += 1) {
+      const attacker = connect(server)
+      await new Promise<void>((resolve) => { attacker.on('open', () => { resolve() }) })
+      attacker.send(serializeMessage({ type: 'pair', payload: { pairingCode: '000000' } }))
+      await nextMessage(attacker, message => message.type === 'error')
+      attacker.close()
+    }
+    // The 11th attempt — from a fresh socket on the same IP — is refused
+    // before any verification runs.
+    const blocked = connect(server)
+    await new Promise<void>((resolve) => { blocked.on('open', () => { resolve() }) })
+    blocked.send(serializeMessage({ type: 'pair', payload: { pairingCode: '000000' } }))
+    const error = await nextMessage(blocked, message => message.type === 'error')
+    expect((error.payload as { code: string }).code).toBe('pair.blocked')
+    blocked.close()
+  })
+
+  it('caps concurrent sockets per source IP', async () => {
+    const server = await startRelay()
+    const open: WebSocket[] = []
+    for (let i = 0; i < 32; i += 1) {
+      const socket = connect(server)
+      open.push(socket)
+      await new Promise<void>((resolve) => { socket.on('open', () => { resolve() }) })
+    }
+    const extra = connect(server)
+    await new Promise<void>((resolve) => { extra.on('close', () => { resolve() }) })
+    for (const socket of open) socket.close()
+  })
+
+  it('forwards a device-originated error reply to the awaiting app', async () => {
+    const server = await startRelay()
+    const device = connect(server)
+    await new Promise<void>((resolve) => { device.on('open', () => { resolve() }) })
+    const { app, token } = await pairApp(server, device)
+
+    app.send(serializeMessage({
+      type: 'request', id: 'req-err', deviceId: 'my-pc',
+      payload: { token, method: 'chat.send', params: {} },
+    }))
+    const forwarded = await nextMessage(device, message => message.type === 'request' && message.id === 'req-err')
+    device.send(serializeMessage({ type: 'error', id: forwarded.id, payload: { code: 'chat.busy', message: 'busy' } }))
+    const error = await nextMessage(app, message => message.type === 'error' && message.id === 'req-err')
+    expect((error.payload as { code: string }).code).toBe('chat.busy')
+  })
+
+  it('ignores a forged response from a socket that is not the routed device', async () => {
+    const server = await startRelay()
+    const device = connect(server)
+    await new Promise<void>((resolve) => { device.on('open', () => { resolve() }) })
+    const { app, token } = await pairApp(server, device)
+
+    app.send(serializeMessage({
+      type: 'request', id: 'req-forge', deviceId: 'my-pc',
+      payload: { token, method: 'plugin.list', params: {} },
+    }))
+    const forwarded = await nextMessage(device, message => message.type === 'request' && message.id === 'req-forge')
+
+    // An unauthenticated stranger tries to settle the pending request first.
+    const stranger = connect(server)
+    await new Promise<void>((resolve) => { stranger.on('open', () => { resolve() }) })
+    stranger.send(serializeMessage({ type: 'response', id: forwarded.id, payload: { result: { forged: true } } }))
+    await new Promise(resolve => setTimeout(resolve, 100))
+
+    // The real device's answer still wins.
+    device.send(serializeMessage({ type: 'response', id: forwarded.id, payload: { result: { real: true } } }))
+    const echoed = await nextMessage(app, message => message.type === 'response' && message.id === 'req-forge')
+    expect((echoed.payload as { result: unknown }).result).toEqual({ real: true })
+    stranger.close()
+  })
+
+  it('rejects a device hello with an empty secret', async () => {
+    const server = await startRelay()
+    const socket = connect(server)
+    await new Promise<void>((resolve) => { socket.on('open', () => { resolve() }) })
+    socket.send(serializeMessage({ type: 'hello', deviceId: 'my-pc', payload: { deviceSecret: '' } }))
+    const error = await nextMessage(socket, message => message.type === 'error')
+    expect((error.payload as { code: string }).code).toBe('auth.failed')
+    socket.close()
+  })
 })

@@ -15,6 +15,7 @@ dsh 远程控制能力的独立 WebSocket 中继。设备（运行 `@firefly0621
 | `DSH_RELAY_DEVICE_SECRETS` | — | 逗号分隔的 `deviceId:secret` 对，即设备注册表 |
 | `DSH_RELAY_ALLOW_AUTO_REGISTER` | — | `1` 接受未知随机 `deviceId` 的首次 hello 并绑定（插件的零配置模式） |
 | `DSH_RELAY_DATA_DIR` | — | 持久化会话存储目录；缺省时会话仅存内存 |
+| `DSH_RELAY_TRUST_PROXY` | — | `1` 时用 `X-Forwarded-For` 最左地址做 per-IP 限流（仅可信反代之后） |
 | `TLS_CERT` / `TLS_KEY` | — | PEM 证书/密钥路径；`NODE_ENV=production` 时必填 |
 
 ## 部署（VPS 上的 systemd）
@@ -48,6 +49,9 @@ WantedBy=multi-user.target
 - **会话控制权在设备侧**：绑定的设备可以列出（`sessions.list`）和吊销（`sessions.revoke`）其 App 会话；被吊销的 token 无法恢复会话。
 - **中继是哑管道**：它从不检查命令载荷、从不持久化消息内容。中继被攻破只暴露路由元数据，而非设置值——但设置读取仍会经过它，因此 TLS 是强制的。
 - **配对码**：6 位、10 分钟有效、一次性、最多 5 次错误尝试。设备每次（重新）注册时轮换。
+- **配对暴力破解受限流**：失败的 `pair` 尝试按来源 IP 计数（每分钟 10 次），超限的 IP 封禁 10 分钟；每个来源 IP 最多 32 个并发连接；设备 secret 采用常量时间比较。
+- **会话按设备隔离**：`sessions.revoke` 只吊销发起请求的设备自己的会话，无法影响其他设备的 token。
+- **请求快速失败**：设备断开时其待应答请求立即以 `device.offline` 失败；超过 30 秒未应答则超时——App 不会挂起，中继内存不会泄漏。
 - **心跳**：对端每 30s ping；静默 60s 的连接被断开。
 
 ## 协议

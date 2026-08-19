@@ -1,6 +1,6 @@
-import { createServer as createHttpServer, type Server as HttpServer } from 'node:http'
+import { createServer as createHttpServer, type IncomingMessage, type Server as HttpServer } from 'node:http'
 import { createServer as createHttpsServer, type Server as HttpsServer } from 'node:https'
-import { randomUUID } from 'node:crypto'
+import { randomUUID, timingSafeEqual } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { WebSocketServer, WebSocket } from 'ws'
 import {
@@ -12,6 +12,23 @@ import {
   type EventPayload,
 } from '@firefly0621/dsh-remote-protocol'
 import { PairingStore, SessionStore } from './pairing.ts'
+
+/** Security invariants (kept fixed, not deployment-configurable). */
+const PAIR_FAILURE_LIMIT = 10
+const PAIR_FAILURE_WINDOW_MS = 60_000
+const PAIR_BLOCK_MS = 600_000
+const MAX_SOCKETS_PER_IP = 32
+const PENDING_REQUEST_TTL_MS = 30_000
+/** Auto-registered devices (first-seen-wins) and sessions per device stay bounded. */
+const MAX_DEVICES = 1_024
+const MAX_SESSIONS_PER_DEVICE = 32
+
+/** Constant-time secret comparison; empty or differing-length secrets compare false. */
+function secretsEqual(a: string, b: string): boolean {
+  const left = Buffer.from(a)
+  const right = Buffer.from(b)
+  return left.length > 0 && left.length === right.length && timingSafeEqual(left, right)
+}
 
 /** Server configuration; port 0 picks an OS-assigned port for tests. */
 export interface RelayConfig {
@@ -28,13 +45,45 @@ export interface RelayConfig {
   allowAutoRegister?: boolean
   /** Directory for durable session storage; absent keeps sessions in memory. */
   dataDir?: string
+  /** When true, per-IP caps use the leftmost `X-Forwarded-For` address (trusted reverse proxy only). */
+  trustProxy?: boolean
   tlsCert?: string
   tlsKey?: string
+}
+
+/** Resolve the client IP for rate limits; optionally honor `X-Forwarded-For` behind a trusted proxy. */
+function clientIp(request: IncomingMessage, trustProxy: boolean): string {
+  if (trustProxy) {
+    const forwarded = request.headers['x-forwarded-for']
+    const raw = Array.isArray(forwarded) ? forwarded[0] : forwarded
+    if (typeof raw === 'string' && raw.length > 0) {
+      const first = raw.split(',')[0]?.trim()
+      if (first !== undefined && first.length > 0) return first
+    }
+  }
+  return request.socket.remoteAddress ?? 'unknown'
 }
 
 interface DeviceConnection {
   socket: WebSocket
   name: string
+}
+
+/** One app request awaiting the device's response. */
+interface PendingRequest {
+  /** The app socket to deliver the reply to. */
+  socket: WebSocket
+  /** The device the request was routed to; failed when that device disconnects. */
+  deviceId: string
+  /** Replies past this point are dropped and the app told the request timed out. */
+  expiresAt: number
+}
+
+/** Per-IP `pair` failure accounting; a blocked IP is rejected until `blockedUntil`. */
+interface PairFailureWindow {
+  count: number
+  windowStart: number
+  blockedUntil: number
 }
 
 /**
@@ -51,10 +100,14 @@ export class RelayServer {
   private readonly pairings = new PairingStore()
   private readonly sessions: SessionStore
   /** request id → the app socket waiting for the device's response. */
-  private readonly pending = new Map<string, WebSocket>()
+  private readonly pending = new Map<string, PendingRequest>()
   /** session token → the app socket bound to it (device→app `event` pushes). */
   private readonly sessionSockets = new Map<string, WebSocket>()
   private readonly lastSeen = new Map<WebSocket, number>()
+  /** Source IP of each socket, and per-IP open-socket counts (DoS caps). */
+  private readonly socketIps = new Map<WebSocket, string>()
+  private readonly ipSocketCounts = new Map<string, number>()
+  private readonly ipPairFailures = new Map<string, PairFailureWindow>()
   private heartbeatTimer: NodeJS.Timeout | undefined
   private listening = false
 
@@ -92,7 +145,7 @@ export class RelayServer {
     }
     this.http = http
     this.wss = new WebSocketServer({ server: http, maxPayload: 1_048_576 })
-    this.wss.on('connection', (socket) => { this.handleConnection(socket) })
+    this.wss.on('connection', (socket, request) => { this.handleConnection(socket, request) })
     this.heartbeatTimer = setInterval(() => { this.reap() }, HEARTBEAT_INTERVAL_MS)
     await new Promise<void>((resolve, reject) => {
       http.once('error', reject)
@@ -124,7 +177,15 @@ export class RelayServer {
     this.listening = false
   }
 
-  private handleConnection(socket: WebSocket): void {
+  private handleConnection(socket: WebSocket, request: IncomingMessage): void {
+    const ip = clientIp(request, this.config.trustProxy ?? false)
+    this.socketIps.set(socket, ip)
+    const open = this.ipSocketCounts.get(ip) ?? 0
+    if (open >= MAX_SOCKETS_PER_IP) {
+      socket.close(1008, 'too many connections from one address')
+      return
+    }
+    this.ipSocketCounts.set(ip, open + 1)
     this.sockets.add(socket)
     socket.on('message', (data) => {
       this.touch(socket)
@@ -139,9 +200,33 @@ export class RelayServer {
     })
     socket.on('close', () => {
       this.sockets.delete(socket)
+      this.socketIps.delete(socket)
+      const remaining = (this.ipSocketCounts.get(ip) ?? 1) - 1
+      if (remaining <= 0) this.ipSocketCounts.delete(ip)
+      else this.ipSocketCounts.set(ip, remaining)
       this.deregister(socket)
     })
     socket.on('error', () => { socket.terminate() })
+  }
+
+  /** True while the IP is under a pair-failure block. */
+  private pairBlocked(ip: string): boolean {
+    return (this.ipPairFailures.get(ip)?.blockedUntil ?? 0) > Date.now()
+  }
+
+  /** Count one failed `pair` for the source IP; crossing the budget blocks it. */
+  private notePairFailure(ip: string): void {
+    const now = Date.now()
+    const entry = this.ipPairFailures.get(ip)
+    if (entry === undefined || now - entry.windowStart > PAIR_FAILURE_WINDOW_MS) {
+      this.ipPairFailures.set(ip, { count: 1, windowStart: now, blockedUntil: 0 })
+      return
+    }
+    entry.count += 1
+    if (entry.count >= PAIR_FAILURE_LIMIT) {
+      entry.count = 0
+      entry.blockedUntil = now + PAIR_BLOCK_MS
+    }
   }
 
   /** Record activity so the heartbeat reaper can identify silent peers. */
@@ -149,7 +234,7 @@ export class RelayServer {
     this.lastSeen.set(socket, Date.now())
   }
 
-  /** Terminate and deregister any connection silent past the timeout. */
+  /** Terminate and deregister any connection silent past the timeout; fail expired pending requests. */
   private reap(): void {
     const now = Date.now()
     for (const [socket, seen] of this.lastSeen) {
@@ -157,15 +242,28 @@ export class RelayServer {
       this.deregister(socket)
       socket.terminate()
     }
+    for (const [id, pending] of this.pending) {
+      if (now <= pending.expiresAt) continue
+      this.pending.delete(id)
+      this.reply(pending.socket, { id, type: 'error', payload: { code: 'request.timeout', message: 'device did not answer' } })
+    }
   }
 
   /** Remove a socket from every registry (devices, pending, sessionSockets, lastSeen). */
   private deregister(socket: WebSocket): void {
     for (const [deviceId, connection] of this.devices) {
-      if (connection.socket === socket) this.devices.delete(deviceId)
+      if (connection.socket !== socket) continue
+      this.devices.delete(deviceId)
+      // The device is gone: fail every request awaiting its reply so the app
+      // does not hang until the pending TTL.
+      for (const [id, pending] of this.pending) {
+        if (pending.deviceId !== deviceId) continue
+        this.pending.delete(id)
+        this.reply(pending.socket, { id, type: 'error', payload: { code: 'device.offline', message: 'device not connected' } })
+      }
     }
-    for (const [id, waiting] of this.pending) {
-      if (waiting === socket) this.pending.delete(id)
+    for (const [id, pending] of this.pending) {
+      if (pending.socket === socket) this.pending.delete(id)
     }
     for (const [token, bound] of this.sessionSockets) {
       if (bound === socket) this.sessionSockets.delete(token)
@@ -186,14 +284,33 @@ export class RelayServer {
       case 'hello': {
         const deviceId = message.deviceId
         const secret = (message.payload as { deviceSecret?: unknown }).deviceSecret
-        const known = deviceId === undefined ? undefined : this.deviceSecrets.get(deviceId)
-        if (typeof deviceId !== 'string' || typeof secret !== 'string' || (secret !== known && !(this.allowAutoRegister && known === undefined))) {
+        if (typeof deviceId !== 'string' || typeof secret !== 'string') {
           this.log(`auth failed for device ${String(deviceId)}`)
           this.reply(socket, { type: 'error', payload: { code: 'auth.failed', message: 'bad device secret' } })
           socket.close()
           return
         }
-        if (known === undefined) this.deviceSecrets.set(deviceId, secret)
+        const known = this.deviceSecrets.get(deviceId)
+        if (known !== undefined) {
+          if (!secretsEqual(secret, known)) {
+            this.log(`auth failed for device ${deviceId}`)
+            this.reply(socket, { type: 'error', payload: { code: 'auth.failed', message: 'bad device secret' } })
+            socket.close()
+            return
+          }
+        } else if (!this.allowAutoRegister) {
+          this.log(`auth failed for device ${deviceId}`)
+          this.reply(socket, { type: 'error', payload: { code: 'auth.failed', message: 'bad device secret' } })
+          socket.close()
+          return
+        } else if (this.deviceSecrets.size >= MAX_DEVICES) {
+          this.log(`auth rejected for device ${deviceId}: device registry is full`)
+          this.reply(socket, { type: 'error', payload: { code: 'auth.failed', message: 'bad device secret' } })
+          socket.close()
+          return
+        } else {
+          this.deviceSecrets.set(deviceId, secret)
+        }
         const previous = this.devices.get(deviceId)
         if (previous !== undefined && previous.socket !== socket) {
           this.reply(previous.socket, { type: 'error', payload: { code: 'device.replaced', message: 're-registered elsewhere' } })
@@ -208,14 +325,27 @@ export class RelayServer {
         break
       }
       case 'pair': {
+        // 6-digit codes are brute-forceable; budget failures per source IP.
+        const ip = this.socketIps.get(socket) ?? 'unknown'
+        if (this.pairBlocked(ip)) {
+          this.reply(socket, { type: 'error', payload: { code: 'pair.blocked', message: 'too many failed pairing attempts; try again later' } })
+          socket.close()
+          return
+        }
         const { pairingCode } = message.payload as { pairingCode: string }
         const deviceId = this.pairings.verify(pairingCode)
         if (deviceId === undefined) {
           this.log('pair rejected: bad or expired pairing code')
+          this.notePairFailure(ip)
           this.reply(socket, { type: 'error', payload: { code: 'pair.invalid', message: 'bad or expired pairing code' } })
           return
         }
         this.pairings.consume(pairingCode)
+        this.ipPairFailures.delete(ip)
+        if (this.sessions.list(deviceId).length >= MAX_SESSIONS_PER_DEVICE) {
+          this.reply(socket, { type: 'error', payload: { code: 'sessions.full', message: 'too many sessions for this device' } })
+          return
+        }
         const connection = this.devices.get(deviceId)
         if (connection === undefined) {
           this.reply(socket, { type: 'error', payload: { code: 'device.offline', message: 'device not connected' } })
@@ -249,7 +379,7 @@ export class RelayServer {
           return
         }
         const id = message.id ?? randomUUID()
-        this.pending.set(id, socket)
+        this.pending.set(id, { socket, deviceId: target, expiresAt: Date.now() + PENDING_REQUEST_TTL_MS })
         this.reply(device.socket, { type: 'request', id, deviceId: target, payload: { method, params } })
         break
       }
@@ -275,7 +405,11 @@ export class RelayServer {
       case 'sessions.list': {
         const deviceId = this.deviceIdOf(socket)
         if (deviceId === undefined) {
-          this.reply(socket, { type: 'error', payload: { code: 'auth.failed', message: 'device not authenticated' } })
+          this.reply(socket, {
+            ...(message.id === undefined ? {} : { id: message.id }),
+            type: 'error',
+            payload: { code: 'auth.failed', message: 'device not authenticated' },
+          })
           return
         }
         this.reply(socket, {
@@ -289,19 +423,29 @@ export class RelayServer {
         const deviceId = this.deviceIdOf(socket)
         const sessionId = (message.payload as { sessionId?: unknown }).sessionId
         if (deviceId === undefined) {
-          this.reply(socket, { type: 'error', payload: { code: 'auth.failed', message: 'device not authenticated' } })
+          this.reply(socket, {
+            ...(message.id === undefined ? {} : { id: message.id }),
+            type: 'error',
+            payload: { code: 'auth.failed', message: 'device not authenticated' },
+          })
           return
         }
         if (typeof sessionId !== 'string') {
-          this.reply(socket, { type: 'error', payload: { code: 'payload.invalid', message: 'sessionId must be a string' } })
+          this.reply(socket, {
+            ...(message.id === undefined ? {} : { id: message.id }),
+            type: 'error',
+            payload: { code: 'payload.invalid', message: 'sessionId must be a string' },
+          })
           return
         }
+        // A device revokes only its own sessions; foreign tokens stay live.
+        const owned = this.sessions.resolve(sessionId)?.deviceId === deviceId
         this.reply(socket, {
           ...(message.id === undefined ? {} : { id: message.id }),
           type: 'sessions.revoke',
-          payload: { sessionId, revoked: this.sessions.revoke(sessionId) },
+          payload: { sessionId, revoked: owned && this.sessions.revoke(sessionId) },
         })
-        this.sessionSockets.delete(sessionId)
+        if (owned) this.sessionSockets.delete(sessionId)
         break
       }
       case 'event': {
@@ -329,9 +473,22 @@ export class RelayServer {
         const id = message.id
         if (id === undefined) return
         const waiting = this.pending.get(id)
-        if (waiting === undefined) return
+        // Only the device the request was routed to may answer it; anything
+        // else is a forged reply and is dropped.
+        if (waiting === undefined || this.deviceIdOf(socket) !== waiting.deviceId) return
         this.pending.delete(id)
-        this.reply(waiting, { type: 'response', id, payload: message.payload })
+        this.reply(waiting.socket, { type: 'response', id, payload: message.payload })
+        break
+      }
+      case 'error': {
+        // Device → relay → app: an error is a terminal reply to a pending
+        // request, correlated by the same id as `response`.
+        const id = message.id
+        if (id === undefined) return
+        const waiting = this.pending.get(id)
+        if (waiting === undefined || this.deviceIdOf(socket) !== waiting.deviceId) return
+        this.pending.delete(id)
+        this.reply(waiting.socket, { type: 'error', id, payload: message.payload })
         break
       }
       case 'ping': {

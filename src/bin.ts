@@ -8,8 +8,8 @@ const deviceSecrets: Record<string, string> = {}
 for (const pair of secretsText.split(',')) {
   if (pair.length === 0) continue
   const [deviceId, secret, ...rest] = pair.split(':')
-  if (deviceId === undefined || secret === undefined || rest.length > 0) {
-    throw new Error(`relay: malformed DSH_RELAY_DEVICE_SECRETS entry "${pair}" (expected deviceId:secret)`)
+  if (deviceId === undefined || secret === undefined || rest.length > 0 || deviceId.length === 0 || secret.length === 0) {
+    throw new Error(`relay: malformed DSH_RELAY_DEVICE_SECRETS entry "${pair}" (expected deviceId:secret, both non-empty)`)
   }
   deviceSecrets[deviceId] = secret
 }
@@ -19,6 +19,8 @@ const relayConfig: {
   requireTls: boolean
   allowAutoRegister: boolean
   deviceSecrets: Record<string, string>
+  dataDir?: string
+  trustProxy?: boolean
   tlsCert?: string
   tlsKey?: string
 } = {
@@ -29,6 +31,8 @@ const relayConfig: {
 }
 if (process.env.TLS_CERT !== undefined) relayConfig.tlsCert = process.env.TLS_CERT
 if (process.env.TLS_KEY !== undefined) relayConfig.tlsKey = process.env.TLS_KEY
+if (process.env.DSH_RELAY_DATA_DIR !== undefined) relayConfig.dataDir = process.env.DSH_RELAY_DATA_DIR
+if (process.env.DSH_RELAY_TRUST_PROXY === '1') relayConfig.trustProxy = true
 
 const relay = new RelayServer(relayConfig)
 await relay.start()

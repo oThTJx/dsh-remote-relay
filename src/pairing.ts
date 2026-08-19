@@ -23,8 +23,13 @@ export class PairingStore {
 
   /** Mint one 6-digit code bound to a device, replacing any older one. */
   issue(deviceId: string): { code: string; expiresAt: number } {
+    const now = this.nowMs()
+    // Reap expired codes so an idle registry never grows.
+    for (const [code, record] of this.codes) {
+      if (now > record.expiresAt) this.codes.delete(code)
+    }
     const code = String(randomInt(0, 1_000_000)).padStart(PAIRING_CODE_LENGTH, '0')
-    const expiresAt = this.nowMs() + PAIRING_CODE_TTL_MS
+    const expiresAt = now + PAIRING_CODE_TTL_MS
     this.codes.set(code, { deviceId, expiresAt, attempts: 0, consumed: false })
     return { code, expiresAt }
   }
